@@ -136,6 +136,53 @@ class PlanRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Inventory mode (registered stock batches)
+# --------------------------------------------------------------------------- #
+
+
+class BatchRegisterIn(BaseModel):
+    """Registration of a physical stock batch."""
+    id: str = Field(min_length=1, max_length=64)
+    concentration: Union[str, int]
+    initial_volume_nl: int = Field(gt=0)
+
+    @field_validator("id")
+    @classmethod
+    def _id(cls, v):
+        if v.startswith("@"):
+            raise ValueError("ids must not start with '@' (reserved prefix)")
+        return v
+
+    @field_validator("concentration")
+    @classmethod
+    def _conc(cls, v):
+        return Concentration.validate(v)
+
+
+class InventoryPlanIn(BaseModel):
+    """Plan request that draws from registered batches instead of
+    request-local stock definitions."""
+    batch_ids: list[str] = Field(min_length=1)
+    diluent: DiluentIn
+    wells: list[WellIn] = Field(min_length=1)
+    containers: list[ContainerIn] = Field(default_factory=list)
+    pipette: PipetteIn
+    default_well_capacity_nl: int = Field(gt=0)
+    limits: LimitsIn = Field(default_factory=LimitsIn)
+
+    @field_validator("batch_ids")
+    @classmethod
+    def _batch_ids(cls, v):
+        for b in v:
+            if not b or len(b) > 64:
+                raise ValueError("batch ids must be 1..64 characters")
+            if b.startswith("@"):
+                raise ValueError(
+                    "ids must not start with '@' (reserved prefix)")
+        return v
+
+
+# --------------------------------------------------------------------------- #
 # Response pieces
 # --------------------------------------------------------------------------- #
 

@@ -3,6 +3,13 @@
 给定母液、稀释液、目标孔、中间液容器和移液器能力，计算一份**可直接执行的精确转移计划**：
 每一步的来源、目的、体积，以及各孔的最终浓度。
 
+支持两种模式：
+
+- **普通模式**（`POST /plans`）：母液随请求内联声明，一次性求解；
+- **库存模式**（`POST /inventory/plans`）：母液以**批次**预先登记（唯一 ID、浓度、初始体积），
+  多份计划共享同一批母液；计划可行时按实际转出体积**原子预留**库存，
+  预留可**确认执行**（计入已用量）或**取消**（归还库存）。
+
 - 体积一律使用**整数纳升（nL）**；
 - 浓度一律使用**有理数**（`fractions.Fraction`，输入如 `"2/3"`、`"0.25"`、`"40"`）；
 - 中间液可逐级稀释，容器间转移构成的图**不得有环**；
@@ -28,7 +35,8 @@ docker compose up --build
 
 1. 拉取 `postgres:16-alpine` 并健康检查通过；
 2. 在应用镜像内 `pip install -r requirements.txt`；
-3. 应用启动时自动连接数据库并执行 `CREATE TABLE IF NOT EXISTS plans ...` 建表。
+3. 应用启动时自动连接数据库并执行 `CREATE TABLE IF NOT EXISTS ...` 建表
+   （`plans`、`batches`、`reservations`、`reservation_items`）。
 
 服务地址与端口：
 
@@ -97,6 +105,79 @@ docker compose up --build
 
 取回冻结结果（可行 `200`，无解 `422`，不存在 `404`）。
 
+### `POST /batches`
+
+登记一个母液批次。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 批次唯一 ID（1–64 字符，不得以 `@` 开头） |
+| `concentration` | int / string | 有理数浓度（非负），如 `"1000"`、`"2/3"` |
+| `initial_volume_nl` | int | 初始体积（nL，正整数） |
+
+**响应：**
+
+- `201 Created`：新批次，体含 `id`、`concentration`、`initial_volume_nl`、`reserved_nl`、`used_nl`、`available_nl`；
+- `200 OK`：同 ID 且内容完全相同的重复登记（幂等），返回已存在批次；
+- `409 Conflict`：同 ID 但浓度或初始体积不同（`error: "batch_conflict"`）；
+- `400 Bad Request`：非法数值/类型。
+
+批次的可用量恒为 `available_nl = initial_volume_nl - reserved_nl - used_nl`。
+
+### `GET /batches` / `GET /batches/{batch_id}`
+
+列出全部批次，或查询单个批次的登记信息与实时 `reserved_nl` / `used_nl` / `available_nl`（不存在 `404`）。
+
+### `POST /inventory/plans`
+
+库存模式配液计划。请求头 `X-Request-ID`（**必填**），语义与 `/plans` 相同。
+
+请求体与 `/plans` 的唯一区别：用 `batch_ids`（已登记批次 ID 列表，至少 1 个、不可重复）
+替换 `stocks`；`diluent`、`wells`、`containers`、`pipette`、`default_well_capacity_nl`、
+`limits` 完全相同。求解沿用同一精确求解器，批次以其**当前可用量**参与求解。
+
+**响应：**
+
+- `201 Created`：新计划。体含 `status:"feasible"`、`request_id`、`plan`（结构同 `/plans`）、
+  `reservations[]`（`{batch_id, reserved_nl}`，即计划实际从各批次转出的体积）、
+  `reservation_status:"reserved"`。**预留与计划冻结在同一个数据库事务中原子提交**：
+  批次行以 `SELECT ... FOR UPDATE` 加锁后校验可用量，并发提交不会超卖。
+- `200 OK`：相同请求号 + 相同内容重试，返回原创建结果（**不会重复预留**）。
+- `409 Conflict`：相同请求号但内容不同。
+- `422 Unprocessable Entity`：无解或库存不足。体含 `blocked[]`、`reason`、`constraints`；
+  库存不足时 `reason` 为 `insufficient_inventory`（竞态下还附 `shortages[]`：
+  各批次的 `required_nl` 与 `available_nl`），并附 `inventory[]` 快照说明各批次余量。
+  **失败结果同样被冻结，且不占用任何库存**。
+- `400 Bad Request`：非法数值/引用；引用未登记批次时 `error` 为 `unknown_batch`
+  （不冻结、不占库存，登记后可复用同一请求号重试）。
+
+### `POST /inventory/plans/{request_id}/confirm`
+
+确认执行已预留的计划：各批次对应体积从 `reserved_nl` 转入 `used_nl`（计入已用量）。
+
+- `200 OK`：`status:"confirmed"`；重复确认幂等（`changed:false`，余额不再变动）；
+- `409 Conflict`：该预留已取消（`error: "reservation_state_conflict"`）；
+- `404 Not Found`：该请求号没有预留记录。
+
+确认后的预留**不可取消**。
+
+### `POST /inventory/plans/{request_id}/cancel`
+
+取消已预留的计划：各批次对应体积从 `reserved_nl` 归还为可用量，**只归还一次**。
+
+- `200 OK`：`status:"cancelled"`；重复取消幂等（`changed:false`，不会重复归还）；
+- `409 Conflict`：该预留已确认（确认后不可取消）；
+- `404 Not Found`：该请求号没有预留记录。
+
+确认/取消通过预留行的 `SELECT ... FOR UPDATE` 串行化：**重复与并发操作收敛到同一最终状态**
+（并发 confirm+cancel 中恰好一个生效，其余收到幂等回放或 409）。
+
+### `GET /inventory/plans/{request_id}`
+
+取回冻结的库存计划（可行 `200`，无解 `422`，不存在 `404`），并叠加**实时**预留状态
+（`reservation_status` 与 `reservation_items`）；`GET /plans/{request_id}` 返回的则是
+创建时刻冻结的原始结果，两者互补。
+
 ---
 
 ## 4. 调用示例
@@ -121,6 +202,13 @@ bash examples/curl.sh
 python3 examples/call_api.py
 ```
 
+库存模式完整生命周期（登记批次 → 计划并预留 → 重试/冲突 → 确认/取消 → 实时余量）：
+
+```bash
+bash examples/inventory.sh
+python3 examples/inventory_demo.py
+```
+
 示例（1000 浓度母液，移液器 500–1000nL、步进 100nL，目标 A1=400、A2=100）会生成
 两个中间液（如 400 与 100），并把较大的批量安排进较大的容器，所有转移均为 500–1000nL。
 
@@ -141,22 +229,42 @@ python3 examples/call_api.py
 ```bash
 python3 tests/smoke.py
 python3 tests/api_smoke.py   # 需已安装 fastapi/pydantic/httpx
+python3 -m pytest tests/     # 完整测试（含库存模式与并发用例）
 ```
 
 ## 6. 目录结构
 
 ```
 app/
-  main.py          FastAPI 路由与状态码
+  main.py          FastAPI 路由与状态码（/plans、/batches、/inventory/plans、确认/取消）
   models.py        Pydantic 请求/响应模型与浓度校验
-  planning.py      请求 -> 求解器映射、引用校验、幂等哈希
-  db.py            asyncpg 连接、建表、冻结/取回
+  planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计
+  db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、确认/取消
   solver/
     core.py        数据结构、移液器可行性、最小批量
     options.py     候选方案（直接/双源/新中间液/逐级稀释链）
     engine.py      回溯状态、批量与容器可行性
     solve.py       solve() 入口、计划组装、独立校验、无解诊断
-examples/          request.json、curl.sh、call_api.py
-tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）
+examples/          request.json、inventory.json、curl.sh、inventory.sh、
+                   call_api.py、inventory_demo.py
+tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）、
+                   test_api.py、test_solver.py、test_inventory.py（库存/并发）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
+
+---
+
+## 7. 本轮变动（库存模式）
+
+1. **新增批次登记与库存模式**：`POST/GET /batches`、`POST /inventory/plans`、
+   `POST /inventory/plans/{id}/confirm|cancel`、`GET /inventory/plans/{id}`；
+   新增 `batches`、`reservations`、`reservation_items` 三张表（启动时自动创建）。
+2. **原子预留**：可行计划的冻结与各批次 `reserved_nl` 增加在同一事务提交；
+   批次行 `FOR UPDATE` 加锁，并发不超卖；失败（非法批次/无解/库存不足）不占库存。
+3. **预留生命周期**：`reserved → confirmed`（计入 `used_nl`，不可再取消）或
+   `reserved → cancelled`（归还一次）；重复/并发操作幂等收敛。
+4. **数据库连接改为连接池**（`asyncpg.create_pool`），`/health`、`/plans` 行为不变。
+5. **兼容性**：`/plans` 请求格式、`X-Request-ID` 幂等、状态码与冻结语义完全不变；
+   库存模式复用同一冻结机制（同号同体 `200` 原结果、同号异体 `409`）。
+6. **修复**：请求校验异常处理器现在对字段校验器抛出的 `ValueError`
+   （如 `@` 前缀 ID）也能正确返回 `400`（此前会因错误对象无法 JSON 序列化而 500）。

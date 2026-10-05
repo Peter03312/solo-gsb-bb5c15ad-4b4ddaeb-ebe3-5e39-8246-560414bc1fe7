@@ -5,7 +5,7 @@ import hashlib
 import json
 from fractions import Fraction
 
-from .models import PlanRequest
+from .models import InventoryPlanIn, PlanRequest
 from .solver import Problem, Well
 
 
@@ -13,11 +13,8 @@ def _fraction_str(f: Fraction) -> str:
     return str(f)
 
 
-def build_problem(req: PlanRequest) -> Problem:
-    stocks = {
-        s.id: {"conc": Fraction(s.concentration), "volume": s.available_nl}
-        for s in req.stocks
-    }
+def _problem(req, stocks: dict) -> Problem:
+    """Shared request -> Problem mapping for both planning modes."""
     wells = []
     for w in req.wells:
         cap = w.capacity_nl
@@ -45,7 +42,37 @@ def build_problem(req: PlanRequest) -> Problem:
     )
 
 
-def container_ids(req: PlanRequest) -> list[str]:
+def build_problem(req: PlanRequest) -> Problem:
+    stocks = {
+        s.id: {"conc": Fraction(s.concentration), "volume": s.available_nl}
+        for s in req.stocks
+    }
+    return _problem(req, stocks)
+
+
+def build_inventory_problem(req: InventoryPlanIn, batches: dict) -> Problem:
+    """Problem whose stock volumes are the batches' *available* volumes."""
+    stocks = {
+        bid: {
+            "conc": Fraction(batches[bid]["concentration"]),
+            "volume": batches[bid]["available_nl"],
+        }
+        for bid in req.batch_ids
+    }
+    return _problem(req, stocks)
+
+
+def stock_usage_from_plan(plan: dict) -> dict:
+    """Total nanoliters each stock (batch) actually loses in the plan."""
+    usage: dict[str, int] = {}
+    for t in plan["transfers"]:
+        src = t["source"]
+        if src.get("kind") == "stock":
+            usage[src["id"]] = usage.get(src["id"], 0) + t["volume_nl"]
+    return usage
+
+
+def container_ids(req) -> list[str]:
     ids = []
     for i, c in enumerate(req.containers):
         ids.append(c.id if c.id is not None else f"C{i}")
@@ -66,12 +93,8 @@ def relabel_plan(plan: dict, cids: list[str]) -> dict:
     return plan
 
 
-def cross_validate_references(req: PlanRequest) -> None:
-    """Semantic validation that needs the whole request."""
-    stock_ids = [s.id for s in req.stocks]
+def _validate_common(req) -> None:
     well_ids = [w.id for w in req.wells]
-    if len(set(stock_ids)) != len(stock_ids):
-        raise ValueError("duplicate stock id")
     if len(set(well_ids)) != len(well_ids):
         raise ValueError("duplicate well id")
     cids = [c.id for c in req.containers if c.id is not None]
@@ -90,7 +113,22 @@ def cross_validate_references(req: PlanRequest) -> None:
             "no step-aligned transfer volume exists within pipette range")
 
 
-def canonical_request(req: PlanRequest) -> bytes:
+def cross_validate_references(req: PlanRequest) -> None:
+    """Semantic validation that needs the whole request."""
+    stock_ids = [s.id for s in req.stocks]
+    if len(set(stock_ids)) != len(stock_ids):
+        raise ValueError("duplicate stock id")
+    _validate_common(req)
+
+
+def cross_validate_inventory(req: InventoryPlanIn) -> None:
+    """Semantic validation for inventory-mode plan requests."""
+    if len(set(req.batch_ids)) != len(req.batch_ids):
+        raise ValueError("duplicate batch id")
+    _validate_common(req)
+
+
+def canonical_request(req) -> bytes:
     """Stable canonical serialization used for idempotency conflict checks."""
     data = req.model_dump()
 
@@ -106,5 +144,5 @@ def canonical_request(req: PlanRequest) -> bytes:
     return json.dumps(norm(data), sort_keys=True, separators=(",", ":")).encode()
 
 
-def request_hash(req: PlanRequest) -> str:
+def request_hash(req) -> str:
     return hashlib.sha256(canonical_request(req)).hexdigest()
