@@ -118,6 +118,26 @@ class PipetteIn(BaseModel):
     step_nl: int = Field(gt=0)
 
 
+class BatchIn(BaseModel):
+    """Registration of a physical stock batch (inventory mode)."""
+
+    id: str = Field(min_length=1, max_length=64)
+    concentration: Union[str, int]
+    initial_nl: int = Field(gt=0)
+
+    @field_validator("id")
+    @classmethod
+    def _id(cls, v):
+        if v.startswith("@"):
+            raise ValueError("ids must not start with '@' (reserved prefix)")
+        return v
+
+    @field_validator("concentration")
+    @classmethod
+    def _conc(cls, v):
+        return Concentration.validate(v)
+
+
 class LimitsIn(BaseModel):
     max_depth: int = Field(default=3, ge=1, le=6)
     max_search_nodes: int = Field(default=200_000, ge=100, le=20_000_000)
@@ -126,13 +146,34 @@ class LimitsIn(BaseModel):
 
 
 class PlanRequest(BaseModel):
-    stocks: list[StockIn] = Field(min_length=1)
+    """Plan request in one of two modes (exactly one must be present):
+
+    * ``stocks``    - classic ad-hoc mode: stock volumes travel with the
+                      request and nothing is persisted beyond the frozen plan.
+    * ``batch_ids`` - inventory mode: concentrations/volumes come from
+                      registered batches and the plan's draws are reserved.
+    """
+
+    stocks: Optional[list[StockIn]] = Field(default=None, min_length=1)
+    batch_ids: Optional[list[str]] = Field(default=None, min_length=1)
     diluent: DiluentIn
     wells: list[WellIn] = Field(min_length=1)
     containers: list[ContainerIn] = Field(default_factory=list)
     pipette: PipetteIn
     default_well_capacity_nl: int = Field(gt=0)
     limits: LimitsIn = Field(default_factory=LimitsIn)
+
+    @field_validator("batch_ids")
+    @classmethod
+    def _batch_ids(cls, v):
+        if v is None:
+            return v
+        for b in v:
+            if not b or len(b) > 64:
+                raise ValueError("batch ids must be 1..64 characters")
+            if b.startswith("@"):
+                raise ValueError("ids must not start with '@' (reserved prefix)")
+        return v
 
 
 # --------------------------------------------------------------------------- #

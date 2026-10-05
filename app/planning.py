@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from fractions import Fraction
+from typing import Optional
 
 from .models import PlanRequest
 from .solver import Problem, Well
@@ -13,11 +14,24 @@ def _fraction_str(f: Fraction) -> str:
     return str(f)
 
 
-def build_problem(req: PlanRequest) -> Problem:
-    stocks = {
-        s.id: {"conc": Fraction(s.concentration), "volume": s.available_nl}
-        for s in req.stocks
-    }
+def build_problem(req: PlanRequest, batches: Optional[list] = None) -> Problem:
+    """Map a validated request to the solver Problem.
+
+    ``batches`` is the list of registered batch rows (dicts with ``id``,
+    ``concentration``, ``available_nl``) for inventory mode; when None the
+    classic inline ``stocks`` of the request are used.
+    """
+    if batches is not None:
+        stocks = {
+            b["id"]: {"conc": Fraction(b["concentration"]),
+                      "volume": b["available_nl"]}
+            for b in batches
+        }
+    else:
+        stocks = {
+            s.id: {"conc": Fraction(s.concentration), "volume": s.available_nl}
+            for s in req.stocks
+        }
     wells = []
     for w in req.wells:
         cap = w.capacity_nl
@@ -68,10 +82,18 @@ def relabel_plan(plan: dict, cids: list[str]) -> dict:
 
 def cross_validate_references(req: PlanRequest) -> None:
     """Semantic validation that needs the whole request."""
-    stock_ids = [s.id for s in req.stocks]
+    if (req.stocks is None) == (req.batch_ids is None):
+        raise ValueError(
+            "provide exactly one of 'stocks' (classic mode) or "
+            "'batch_ids' (inventory mode)")
+    if req.stocks is not None:
+        stock_ids = [s.id for s in req.stocks]
+        if len(set(stock_ids)) != len(stock_ids):
+            raise ValueError("duplicate stock id")
+    if req.batch_ids is not None:
+        if len(set(req.batch_ids)) != len(req.batch_ids):
+            raise ValueError("duplicate batch id")
     well_ids = [w.id for w in req.wells]
-    if len(set(stock_ids)) != len(stock_ids):
-        raise ValueError("duplicate stock id")
     if len(set(well_ids)) != len(well_ids):
         raise ValueError("duplicate well id")
     cids = [c.id for c in req.containers if c.id is not None]
@@ -90,9 +112,25 @@ def cross_validate_references(req: PlanRequest) -> None:
             "no step-aligned transfer volume exists within pipette range")
 
 
+def stock_usage(plan: dict) -> dict:
+    """Total nl each stock (batch) actually gives up in the plan's transfers."""
+    usage: dict = {}
+    for t in plan["transfers"]:
+        src = t["source"]
+        if src.get("kind") == "stock":
+            usage[src["id"]] = usage.get(src["id"], 0) + t["volume_nl"]
+    return usage
+
+
 def canonical_request(req: PlanRequest) -> bytes:
     """Stable canonical serialization used for idempotency conflict checks."""
     data = req.model_dump()
+    # The two mode selectors are mutually exclusive; drop the absent one so
+    # classic requests hash exactly as they did before inventory mode existed.
+    if data.get("stocks") is None:
+        data.pop("stocks", None)
+    if data.get("batch_ids") is None:
+        data.pop("batch_ids", None)
 
     def norm(x):
         if isinstance(x, Fraction):

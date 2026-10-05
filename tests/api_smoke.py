@@ -43,6 +43,8 @@ class FakeConn:
 
 # monkey-patch get_frozen/freeze to use the in-memory store
 _store = {}
+_batches = {}
+_invs = {}
 
 
 async def fake_get_frozen(conn, request_id):
@@ -58,12 +60,100 @@ async def fake_connect(dsn=None):
     return FakeConn()
 
 
+def _batch_view(b):
+    return {**b, "available_nl":
+            b["initial_nl"] - b["reserved_nl"] - b["used_nl"]}
+
+
+async def fake_insert_batch(conn, batch_id, concentration, initial_nl):
+    if batch_id in _batches:
+        return False, _batch_view(_batches[batch_id])
+    _batches[batch_id] = {"id": batch_id, "concentration": concentration,
+                          "initial_nl": initial_nl,
+                          "reserved_nl": 0, "used_nl": 0}
+    return True, _batch_view(_batches[batch_id])
+
+
+async def fake_get_batch(conn, batch_id):
+    b = _batches.get(batch_id)
+    return _batch_view(b) if b else None
+
+
+async def fake_get_batches(conn, ids):
+    return [_batch_view(_batches[i]) for i in ids if i in _batches]
+
+
+async def fake_list_batches(conn):
+    return [_batch_view(b) for _, b in sorted(_batches.items())]
+
+
+async def fake_freeze_inventory(conn, request_id, rhash, payload, usage):
+    if request_id in _store:
+        return False
+    for bid, amount in usage.items():
+        if amount <= 0:
+            continue
+        b = _batches[bid]
+        avail = b["initial_nl"] - b["used_nl"] - b["reserved_nl"]
+        if avail < amount:
+            raise db.InsufficientInventory(
+                {bid: {"required_nl": amount, "available_nl": avail}})
+    for bid, amount in usage.items():
+        if amount > 0:
+            _batches[bid]["reserved_nl"] += amount
+    _store[request_id] = (rhash, "feasible", payload)
+    _invs[request_id] = {
+        "state": "reserved",
+        "reservations": [{"batch_id": k, "amount_nl": v}
+                         for k, v in sorted(usage.items()) if v > 0],
+    }
+    return True
+
+
+async def _fake_transition(conn, request_id, target):
+    rec = _invs.get(request_id)
+    if rec is None:
+        return None, None
+    if rec["state"] == "reserved":
+        for r in rec["reservations"]:
+            b = _batches[r["batch_id"]]
+            b["reserved_nl"] -= r["amount_nl"]
+            if target == "confirmed":
+                b["used_nl"] += r["amount_nl"]
+        rec["state"] = target
+    return rec["state"], rec["reservations"]
+
+
+async def fake_confirm(conn, request_id):
+    return await _fake_transition(conn, request_id, "confirmed")
+
+
+async def fake_cancel(conn, request_id):
+    return await _fake_transition(conn, request_id, "cancelled")
+
+
+async def fake_get_state(conn, request_id):
+    rec = _invs.get(request_id)
+    if rec is None:
+        return None, None
+    return rec["state"], rec["reservations"]
+
+
 db.connect = fake_connect
 db.get_frozen = fake_get_frozen
 db.freeze = fake_freeze
 main.connect = fake_connect
 main.get_frozen = fake_get_frozen
 main.freeze = fake_freeze
+for mod in (db, main):
+    mod.insert_batch = fake_insert_batch
+    mod.get_batch = fake_get_batch
+    mod.get_batches = fake_get_batches
+    mod.list_batches = fake_list_batches
+    mod.freeze_inventory_plan = fake_freeze_inventory
+    mod.confirm_reservation = fake_confirm
+    mod.cancel_reservation = fake_cancel
+    mod.get_reservation_state = fake_get_state
 
 client = TestClient(main.app)
 
@@ -190,6 +280,104 @@ def test_serial_via_api():
     print("serial dilution via API -> 201, container label tube-1")
 
 
+# --------------------------------------------------------------------------- #
+# Inventory mode: batches, atomic reservation, confirm/cancel
+# --------------------------------------------------------------------------- #
+
+INV_BODY = {
+    "batch_ids": ["B1"],
+    "diluent": {"available_nl": 10_000_000},
+    "wells": [{"id": "A1", "final_volume_nl": 1000,
+               "final_concentration": "40"}],
+    "containers": [],
+    "pipette": {"min_nl": 100, "max_nl": 1000, "step_nl": 50},
+    "default_well_capacity_nl": 5000,
+}
+
+
+def test_register_batch():
+    r = client.post("/batches", json={"id": "B1", "concentration": "100",
+                                      "initial_nl": 1_000_000})
+    assert r.status_code == 201, r.text
+    assert r.json()["available_nl"] == 1_000_000
+    r = client.post("/batches", json={"id": "B1", "concentration": "100",
+                                      "initial_nl": 1_000_000})
+    assert r.status_code == 200  # idempotent re-registration
+    r = client.post("/batches", json={"id": "B1", "concentration": "50",
+                                      "initial_nl": 1_000_000})
+    assert r.status_code == 409  # same id, different content
+    print("batch register -> 201, same -> 200, different -> 409")
+
+
+def test_inventory_plan_and_reservation():
+    r = client.post("/plans", json=INV_BODY, headers={"X-Request-ID": "inv-1"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["mode"] == "inventory" and body["state"] == "reserved"
+    assert body["reservations"] == [{"batch_id": "B1", "reserved_nl": 400}]
+    assert _batches["B1"]["reserved_nl"] == 400
+    print("inventory plan -> 201, reserved 400 nl of B1")
+
+    r = client.post("/plans", json=INV_BODY, headers={"X-Request-ID": "inv-1"})
+    assert r.status_code == 200 and _batches["B1"]["reserved_nl"] == 400
+    print("same id+body retry -> 200, no double reservation")
+
+    changed = json.loads(json.dumps(INV_BODY))
+    changed["wells"][0]["final_concentration"] = "30"
+    r = client.post("/plans", json=changed, headers={"X-Request-ID": "inv-1"})
+    assert r.status_code == 409
+    print("same id, different body -> 409")
+
+    r = client.get("/plans/inv-1/reservation")
+    assert r.status_code == 200 and r.json()["state"] == "reserved"
+    print("GET /plans/inv-1/reservation -> state reserved")
+
+
+def test_unknown_batch_and_insufficient():
+    r = client.post("/plans", json=dict(INV_BODY, batch_ids=["ghost"]),
+                    headers={"X-Request-ID": "inv-x"})
+    assert r.status_code == 400 and "ghost" in r.json()["detail"]
+    print("unknown batch -> 400, nothing reserved")
+
+    small = json.loads(json.dumps(INV_BODY))
+    small["batch_ids"] = ["B2"]
+    small["wells"][0]["final_concentration"] = "40"  # needs 400 of B2
+    client.post("/batches", json={"id": "B2", "concentration": "100",
+                                  "initial_nl": 300})
+    r = client.post("/plans", json=small, headers={"X-Request-ID": "inv-y"})
+    assert r.status_code == 422
+    assert r.json()["inventory"]["B2"]["available_nl"] == 300
+    assert _batches["B2"]["reserved_nl"] == 0
+    print("insufficient inventory -> 422, nothing reserved")
+
+
+def test_confirm_and_cancel_lifecycle():
+    # confirm: reserved -> used, cannot cancel afterwards
+    r = client.post("/plans/inv-1/confirm")
+    assert r.status_code == 200 and r.json()["state"] == "confirmed"
+    assert _batches["B1"]["used_nl"] == 400
+    assert _batches["B1"]["reserved_nl"] == 0
+    r = client.post("/plans/inv-1/confirm")
+    assert r.status_code == 200  # repeated confirm: same final state
+    assert _batches["B1"]["used_nl"] == 400
+    r = client.post("/plans/inv-1/cancel")
+    assert r.status_code == 409  # confirmed cannot be cancelled
+    print("confirm -> used 400; repeat confirm ok; cancel after confirm -> 409")
+
+    # cancel: releases the hold exactly once
+    r = client.post("/plans", json=INV_BODY, headers={"X-Request-ID": "inv-2"})
+    assert r.status_code == 201
+    r = client.post("/plans/inv-2/cancel")
+    assert r.status_code == 200 and r.json()["state"] == "cancelled"
+    assert _batches["B1"]["reserved_nl"] == 0
+    r = client.post("/plans/inv-2/cancel")
+    assert r.status_code == 200  # repeated cancel releases nothing more
+    assert _batches["B1"]["reserved_nl"] == 0
+    r = client.post("/plans/inv-2/confirm")
+    assert r.status_code == 409  # cancelled cannot be confirmed
+    print("cancel -> released once; repeat cancel ok; confirm after cancel -> 409")
+
+
 if __name__ == "__main__":
     with client:
         test_feasible()
@@ -203,4 +391,8 @@ if __name__ == "__main__":
         test_missing_request_id()
         test_rational_concentration()
         test_serial_via_api()
+        test_register_batch()
+        test_inventory_plan_and_reservation()
+        test_unknown_batch_and_insufficient()
+        test_confirm_and_cancel_lifecycle()
     print("\nALL API TESTS PASSED")
